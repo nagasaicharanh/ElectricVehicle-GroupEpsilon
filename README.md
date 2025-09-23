@@ -25,6 +25,8 @@ Energy Used: 4.18 kWh
 Average Consumption: 17.98 kWh/100km (Target WLTP: 18.5 kWh/100km)
 Final SOC: 0.950
 
+Google Colab Link: https://colab.research.google.com/drive/1-bezErEGDKHMqPjqfWFYA9N3MXZ-r6UU?usp=sharing
 
+The scripts can be run online on the cloud instance of Google colab by just clicking the above link and running the cell.
 
 
