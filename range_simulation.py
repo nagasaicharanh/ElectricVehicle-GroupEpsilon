@@ -1,62 +1,9 @@
-# main.py
+# range_simulation.py
 
 import numpy as np
-
-from vehicle_parameters import BYD_SEAL_Premium_Params
+from physics import traction_force_required, mechanical_power_W
 from motor_model import MotorModel
 from battery_model import BatteryModel
-from driving_cycles import simple_wltp_like_cycle, load_csv_cycle
-from simulation_engine import simulate_cycle, constant_speed_energy
-from analysis_plots import plot_timeseries, plot_energy_vs_speed
-from physics import traction_force_required, mechanical_power_W
-
-
-def run_cycle_demo():
-    # Load parameters
-    p = BYD_SEAL_Premium_Params()
-
-    # Instantiate models
-    motor = MotorModel(p.motor_torque_max_Nm, p.motor_power_max_W, p.wheel_radius_m, p.motor_peak_eff)
-    battery = BatteryModel(p.battery_capacity_Wh, p.v_nominal_V, p.v_min_V, p.v_max_V,
-                           p.r_int_ohm, p.soc_min, p.soc_max, p.regen_eff)
-
-    # Driving cycle
-    t_s, v_mps, grade_deg = simple_wltp_like_cycle(total_time_s=1800, dt=1.0)
-    # Alternatively load a CSV with columns: time_s, speed_kmh[, grade_deg]
-    # t_s, v_mps, grade_deg = load_csv_cycle("wltp_subset.csv")
-
-    # Simulate
-    result = simulate_cycle(t_s, v_mps, grade_deg, p, motor, battery, dt_s=1.0, limit_top_speed=True)
-
-    # Compute aggregates
-    total_dist_km = result["distance_km"][-1]
-    total_energy_kWh = result["total_energy_Wh"] / 1000.0
-    avg_consumption_kWh_per_100km = (total_energy_kWh / total_dist_km) * 100.0 if total_dist_km > 0 else np.nan
-
-    print("=== Cycle Summary ===")
-    print(f"Distance: {total_dist_km:.2f} km")
-    print(f"Energy Used: {total_energy_kWh:.2f} kWh")
-    print(f"Average Consumption: {avg_consumption_kWh_per_100km:.2f} kWh/100km (Target WLTP: {p.wltp_energy_kWh_per_100km} kWh/100km)")
-    print(f"Final SOC: {result['soc'][-1]:.3f}")
-
-    # Plots
-    plot_timeseries(result, title="BYD SEAL Premium - WLTP-like Cycle")
-
-
-def constant_speed_sweep():
-    p = BYD_SEAL_Premium_Params()
-    motor = MotorModel(p.motor_torque_max_Nm, p.motor_power_max_W, p.wheel_radius_m, p.motor_peak_eff)
-
-    speeds = np.arange(40, 141, 10)
-    energies = []
-
-    for s in speeds:
-        pkW, e = constant_speed_energy(p, motor, speed_kmh=s, grade_deg=0.0)
-        energies.append(e)
-        print(f"{s:>3} km/h -> {pkW:5.1f} kW, {e:5.1f} kWh/100km")
-
-    plot_energy_vs_speed(speeds, energies)
-
 
 def simulate_full_range_over_cycle(params,
                                    motor_model: MotorModel,
@@ -65,7 +12,7 @@ def simulate_full_range_over_cycle(params,
                                    v_cycle_mps: np.ndarray,
                                    grade_cycle_deg: np.ndarray,
                                    limit_top_speed: bool = True,
-                                   max_hours: float = 15.0):
+                                   max_hours: float = 12.0):
     """
     Loop the given driving cycle until the battery reaches soc_min.
     Returns summary metrics and a small preview of the first cycle’s traces.
@@ -78,23 +25,21 @@ def simulate_full_range_over_cycle(params,
         raise ValueError("Cycle time step must be positive and uniform")
 
     n = len(t_cycle_s)
-
-    # Cap top speed to official limit if desired
     v_cycle = v_cycle_mps.copy()
     if limit_top_speed:
         v_cap = params.max_speed_kmh_official / 3.6
         v_cycle = np.minimum(v_cycle, v_cap)
 
-    # Precompute accelerations for the cycle
+    # Precompute reference accelerations for the cycle (forward difference)
     a_cycle = np.zeros_like(v_cycle)
-    a_cycle[1:] = np.diff(v_cycle) / dt
-    a_cycle[0] = a_cycle[1]  # simple edge handling
+    a_cycle[:-1] = np.diff(v_cycle) / dt
+    a_cycle[-1] = (v_cycle[0] - v_cycle[-1]) / dt  # wrap acceleration at boundary
 
     total_dist_m = 0.0
     total_time_s = 0.0
     total_energy_Wh = 0.0
 
-    # Optional preview buffers (first cycle only)
+    # Optional small preview buffers (only first pass, to avoid huge memory)
     preview_len = min(n, 2000)
     preview = {
         "t_s": t_cycle_s[:preview_len].copy(),
@@ -119,7 +64,7 @@ def simulate_full_range_over_cycle(params,
             a = a_cycle[i]
             grade = grade_cycle_deg[i] if i < len(grade_cycle_deg) else 0.0
 
-            # Longitudinal forces
+            # Longitudinal forces (demand)
             f_req, f_rr, f_aero, f_grad, f_acc = traction_force_required(
                 v, a,
                 params.mass_kg, params.g_m_per_s2,
@@ -137,14 +82,14 @@ def simulate_full_range_over_cycle(params,
             # Mechanical power at wheels
             p_mech = mechanical_power_W(f_deliver, v)
 
-            # Electrical/battery power with aux and regen handling
+            # Electrical/battery power with aux and regen handling (consistent with simulate_cycle)
             if p_mech >= 0:
                 p_batt = p_mech / (params.motor_peak_eff * params.drivetrain_eff) + params.aux_power_W
             else:
                 p_regen = (-p_mech) * params.motor_peak_eff * params.drivetrain_eff * params.regen_eff
                 p_batt = params.aux_power_W - p_regen
 
-            # Advance battery state; returns Wh drawn (positive when discharging)
+            # Advance battery
             e_Wh = battery_model.step(p_batt, dt)
             total_energy_Wh += e_Wh
 
@@ -153,7 +98,7 @@ def simulate_full_range_over_cycle(params,
             total_time_s += dt
             steps += 1
 
-            # Capture preview (first pass only)
+            # Capture a short preview (first pass only)
             if not captured_preview and i < preview_len:
                 preview["soc"][i] = battery_model.soc
                 preview["p_batt_W"][i] = p_batt
@@ -183,43 +128,34 @@ def simulate_full_range_over_cycle(params,
     }
 
 
-def run_full_range_demo():
-    # Parameters and models
-    p = BYD_SEAL_Premium_Params()
-    motor = MotorModel(p.motor_torque_max_Nm, p.motor_power_max_W, p.wheel_radius_m, p.motor_peak_eff)
-    battery = BatteryModel(p.battery_capacity_Wh, p.v_nominal_V, p.v_min_V, p.v_max_V,
-                           p.r_int_ohm, p.soc_min, p.soc_max, p.regen_eff)
-
-    # Choose the profile to measure range against (semester brief)
-    t_s, v_mps, grade_deg = simple_wltp_like_cycle(total_time_s=1800, dt=1.0)
-    # t_s, v_mps, grade_deg = load_csv_cycle("wltp_subset.csv")
-
-    # Run full-battery range simulation
-    res = simulate_full_range_over_cycle(
-        params=p,
-        motor_model=motor,
-        battery_model=battery,
-        t_cycle_s=t_s,
-        v_cycle_mps=v_mps,
-        grade_cycle_deg=grade_deg,
-        limit_top_speed=True,
-        max_hours=15.0
+def constant_speed_range_estimate(params,
+                                  motor_model: MotorModel,
+                                  battery_model: BatteryModel,
+                                  speed_kmh: float,
+                                  grade_deg: float = 0.0):
+    """
+    Closed-form estimate based on steady-state consumption:
+    usable_Wh / (Wh per km at the specified speed).
+    """
+    v = speed_kmh / 3.6
+    # Forces
+    f_req, *_ = traction_force_required(
+        v, 0.0,
+        params.mass_kg, params.g_m_per_s2,
+        params.air_density_kg_per_m3,
+        params.cd, params.frontal_area_m2,
+        grade_deg,
+        params.mu_rr_base, params.mu_rr_k
     )
-
-    print("=== Full-Battery Range over WLTP-like Profile ===")
-    print(f"Range: {res['range_km']:.1f} km")
-    print(f"Drive time: {res['drive_time_h']:.2f} h")
-    print(f"Energy used: {res['energy_used_kWh']:.2f} kWh")
-    print(f"Average consumption: {res['avg_consumption_kWh_per_100km']:.2f} kWh/100km")
-    print(f"Final SOC: {res['final_soc']:.3f}")
-
-
-if __name__ == "__main__":
-    # 1) Run WLTP-like cycle simulation
-    run_cycle_demo()
-
-    # 2) Run constant-speed energy sweep
-    constant_speed_sweep()
-
-    # 3) Run full-battery range over the chosen profile
-    run_full_range_demo()
+    p_mech = f_req * v
+    p_elec = p_mech / (params.motor_peak_eff * params.drivetrain_eff) + params.aux_power_W  # W
+    wh_per_km = (p_elec / 1000.0) * (1000.0 / speed_kmh)  # (kW * s) normalized to Wh/km via speed
+    # Actually, p_elec is W; energy per km at steady speed: Wh/km = (p_elec W) / (v m/s) * (1/3600) * 1000
+    # Simpler: kWh/100km = (p_elec/1000) * (100/speed_kmh); so Wh/km = 10 * (p_elec/1000) / speed_kmh * 1000 = (p_elec * 0.01) / speed_kmh
+    wh_per_km = (p_elec * 0.01) / max(speed_kmh, 1e-6)
+    range_km = ((battery_model.soc - params.soc_min) * params.battery_capacity_Wh) / max(wh_per_km, 1e-9)
+    return {
+        "speed_kmh": speed_kmh,
+        "consumption_Wh_per_km": wh_per_km,
+        "range_km": range_km
+    }
